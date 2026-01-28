@@ -1,258 +1,178 @@
 # HomeCDN
 
-A high-performance content-addressable caching proxy for home networks, written in Rust.
+Local video hosting platform for home networks (~100 users).
 
-**Problem:** Kids watch the same cartoons 50 times. Each replay downloads gigabytes from the internet.
+**Problem:** Unstable internet, repeated content consumption, no local video library.
 
-**Solution:** Transparent caching proxy that identifies identical video content regardless of URL and serves it from local storage.
-
-## How It Works
-
-```
-Internet ← Keenetic Router ← HomeCDN Server ← Kids' Devices
-                                   ↓
-                            Multi-TB Cache Disk
-```
-
-HomeCDN acts as a gateway for selected devices. All their traffic flows through it, and video content gets cached using content-addressable storage.
-
-### Content-Addressable Caching
-
-Traditional proxies use URLs as cache keys. This fails for video platforms because:
-- URLs contain expiring tokens (YouTube: `expire=`, `signature=`)
-- Same video = different URL every request
-- Cache hit ratio: <7%
-
-**HomeCDN approach:**
-1. Intercept HTTPS traffic (MITM proxy)
-2. Detect video CDN domains
-3. Hash first 64KB of content → `content_key`
-4. Same content = same hash, regardless of URL
-5. Cache hit ratio: 90%+ for repeated content
-
-## Research Summary
-
-### Platform Analysis
-
-| Platform | Protocol | Chunk Size | CDN Domains |
-|----------|----------|------------|-------------|
-| YouTube | DASH | Variable | `*.googlevideo.com` |
-| RuTube | HLS | 4 sec | `vod*.rutube.ru` |
-| VK Video | HLS | Variable | `*.vkuservideo.ru`, `*.vkcdn.ru` |
-| Odnoklassniki | HLS | Variable | `*.mycdn.me` |
-| ivi | HLS | Variable | `*.ivi.ru` |
-
-### Why URL-Based Caching Fails
-
-#### YouTube
-- URLs contain time-based tokens: `expire=`, `signature=`
-- Tokens expire within minutes
-- Parameter `lmt` (last modified timestamp) is stable but requires URL parsing
-- Example: `...&lmt=1649501793701287&expire=1654300000&signature=...`
-
-#### RuTube
-- Uses HLS with 4-second chunks
-- CDN distributes load across 250+ servers
-- Video ID extractable via API: `/api/play/options/{video_id}/`
-- Chunks cached internally by RuTube's nginx proxy_cache
-
-### Why Content-Hash Caching Works
-
-Video chunks contain unique frame data. Same video + same quality = identical bytes.
-
-```
-Request 1: https://cdn.example.com/chunk?token=abc123&expire=1000
-Request 2: https://cdn.example.com/chunk?token=xyz789&expire=2000
-           ↓                              ↓
-        [identical 2MB video data]     [identical 2MB video data]
-           ↓                              ↓
-        SHA256 = 0x1a2b3c...           SHA256 = 0x1a2b3c...
-           ↓                              ↓
-        CACHE HIT!                     Served from cache
-```
-
-First 64KB is sufficient for identification:
-- Unique per chunk (different frames)
-- Fast to compute
-- Collision probability: negligible for video content
+**Solution:** Self-hosted video platform with automatic content download from YouTube/RuTube by channel subscriptions, plus graceful fallback when external platforms are unavailable.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      HomeCDN Server                         │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │   Network   │  │    TLS     │  │   Content Router    │ │
-│  │   Gateway   │→│   MITM     │→│  (domain matching)   │ │
-│  │  (iptables) │  │  (rustls)  │  │                     │ │
-│  └─────────────┘  └─────────────┘  └──────────┬──────────┘ │
-│                                                │            │
-│                    ┌───────────────────────────┼───────────┐│
-│                    │              ┌────────────┴─────────┐ ││
-│                    │              ▼                      │ ││
-│  ┌─────────────┐  │  ┌─────────────────────────────────┐│ ││
-│  │  Passthrough│←─┼──│      Video Cache Handler        ││ ││
-│  │   (non-CDN) │  │  │  ┌─────────────────────────┐   ││ ││
-│  └─────────────┘  │  │  │  1. Start streaming     │   ││ ││
-│                    │  │  │  2. Hash first 64KB    │   ││ ││
-│                    │  │  │  3. Check cache        │   ││ ││
-│                    │  │  │  4. Serve or store     │   ││ ││
-│                    │  │  └─────────────────────────┘   ││ ││
-│                    │  └─────────────────────────────────┘│ ││
-│                    └────────────────────────────────────┬┘ ││
-│                                                         │  ││
-│  ┌──────────────────────────────────────────────────────┴┐ ││
-│  │              Content-Addressable Storage              │ ││
-│  │  ┌────────────┐  ┌────────────┐  ┌────────────────┐  │ ││
-│  │  │   Index    │  │   Cache    │  │    Cleanup     │  │ ││
-│  │  │  (SQLite)  │  │   Files    │  │    (LRU)       │  │ ││
-│  │  │            │  │ /aa/bb/... │  │                │  │ ││
-│  │  └────────────┘  └────────────┘  └────────────────┘  │ ││
-│  └───────────────────────────────────────────────────────┘ ││
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                     HomeCDN Server (Intel N100)                  │
+│                                                                  │
+│  ┌──────────────┐   ┌──────────────┐   ┌─────────────────────┐  │
+│  │   MediaCMS    │   │  Pinchflat   │   │  Error Page Server  │  │
+│  │  (UI, search, │   │  (auto-dl    │   │  (landing when      │  │
+│  │   accounts,   │   │   from YT/   │   │   external sites    │  │
+│  │   tags)       │   │   RuTube)    │   │   return errors)    │  │
+│  │              │   │              │   │                     │  │
+│  │  video.home   │   │              │   │                     │  │
+│  └──────┬───────┘   └──────┬───────┘   └─────────┬───────────┘  │
+│         │                  │                      │              │
+│         └──────────┬───────┘                      │              │
+│                    ▼                              │              │
+│  ┌─────────────────────────────┐                  │              │
+│  │    Shared Storage (HDD)     │                  │              │
+│  │    /media/videos/           │                  │              │
+│  └─────────────────────────────┘                  │              │
+│                                                    │              │
+├────────────────────────────────────────────────────┘──────────────┤
+│                    Keenetic Router                                │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  DNS: video.home → 192.168.1.100                         │    │
+│  │  Gateway mode: HomeCDN as gateway for selected devices   │    │
+│  │  Error fallback: non-200 from YT/RuTube → landing page  │    │
+│  └──────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Video CDN Domains
+## Core Components
 
-```rust
-const VIDEO_CDN_PATTERNS: &[&str] = &[
-    // YouTube
-    r".*\.googlevideo\.com",
-    r".*\.youtube\.com",
+### MediaCMS — Video Platform
 
-    // RuTube
-    r"vod.*\.rutube\.ru",
-    r".*\.rutube\.ru",
+Self-hosted YouTube-like platform providing:
+- Web UI with video player, search, tags, categories
+- User accounts with personalized recommendations
+- Accessible at `video.home` on local network
+- Stores transcoded video on shared HDD storage
 
-    // VK Video
-    r".*\.vkuservideo\.ru",
-    r".*\.vkcdn\.ru",
-    r".*\.vk-cdn\.net",
+### Pinchflat — Content Downloader
 
-    // Odnoklassniki
-    r".*\.mycdn\.me",
+Automated video downloader:
+- Subscribe to YouTube/RuTube channels
+- Auto-download new videos on schedule
+- Output to shared storage consumed by MediaCMS
+- Web UI for managing subscriptions
 
-    // ivi
-    r".*\.ivi\.ru",
+### Graceful Fallback
 
-    // CTC/Mult
-    r".*\.ctc\.ru",
+When external video platforms are unavailable — show a helpful landing page instead of a browser error.
 
-    // Generic CDNs (used by many platforms)
-    r".*\.akamaized\.net",
-    r".*\.cloudfront\.net",
-    r".*\.fastly\.net",
-];
-```
+**How it works:**
+1. User tries to access `youtube.com` or `rutube.ru`
+2. Request goes through Keenetic gateway → HomeCDN server
+3. If external platform returns non-200 (error, timeout, network issue) → serve landing page
+4. Landing page shows: network status + link to `video.home` (local library)
+5. If external platform responds normally → no interference, pass through transparently
+
+**Key principle:** zero interference when internet works. Fallback only on actual errors.
+
+## User Accounts & Recommendations
+
+MediaCMS supports multiple user accounts:
+- Each family member has their own profile
+- Watch history and recommendations per user
+- Age-appropriate content tagging
+- ~100 users on the local network (apartment building / community)
+
+## Content Management
+
+### Auto-Download Workflow
+
+1. Admin subscribes to channels in Pinchflat (cartoons, educational, etc.)
+2. Pinchflat downloads new videos to shared HDD
+3. MediaCMS picks up new files and indexes them
+4. Users browse and watch via `video.home`
+
+### Supported Source Platforms
+
+| Platform | Download Support | Notes |
+|----------|-----------------|-------|
+| YouTube | yt-dlp | Full support, DASH/HLS |
+| RuTube | yt-dlp | Full support, HLS |
+| VK Video | yt-dlp | Partial, auth may be required |
+| Odnoklassniki | yt-dlp | Partial |
 
 ## Network Setup
 
-### Option 1: Gateway Mode (Recommended)
+### Keenetic Gateway Mode
 
-Configure Keenetic to use HomeCDN as gateway for specific devices:
+HomeCDN server acts as gateway for devices on the local network:
 
-1. HomeCDN server gets static IP (e.g., 192.168.1.100)
-2. In Keenetic DHCP, set custom gateway for kids' devices MAC addresses
-3. All traffic from those devices routes through HomeCDN
+1. HomeCDN server: static IP `192.168.1.100`
+2. Keenetic DHCP assigns HomeCDN as gateway for selected devices (by MAC)
+3. DNS record: `video.home` → `192.168.1.100`
 
 ```
-Kids' iPad (192.168.1.50)
+User device (192.168.1.50)
     → Gateway: 192.168.1.100 (HomeCDN)
-        → NAT to Keenetic (192.168.1.1)
-            → Internet
+        → Internet works: pass through transparently
+        → Internet error: serve landing page with link to video.home
 ```
 
-### Option 2: Explicit Proxy
+### Error Page Fallback Configuration
 
-Configure devices to use HomeCDN as HTTP/HTTPS proxy:
-- Proxy: 192.168.1.100:8080
-- Requires CA certificate installation on devices
+On the HomeCDN server (acting as gateway):
+- Intercept DNS or HTTP responses from video platform domains
+- On non-200 / timeout / network error → return landing page
+- On success → transparent passthrough
+- No TLS interception, no MITM — only error detection at network level
 
 ## System Requirements
 
 - **Target OS:** Linux (Ubuntu 22.04 LTS)
 - **Architecture:** x86_64 (amd64)
 - **Hardware:**
-  - RAM: 2GB minimum, 4GB recommended
-  - Storage: HDD for cache (any size, recommended >100GB)
+  - CPU: Intel N100 or equivalent
+  - RAM: 4GB minimum, 8GB recommended (MediaCMS + Pinchflat + transcoding)
+  - Storage: HDD for video library (recommended >1TB)
   - Network: Gigabit Ethernet
-- **Recommendation:** Install OS on a separate disk from cache storage. If cache HDD wears out or fails, the system remains operational.
+- **Recommendation:** Install OS on a separate disk from video storage. If HDD fails, the system remains operational.
 
 ## Technology Stack
 
-- **Language:** Rust (performance, safety, async)
-- **Async Runtime:** tokio
-- **TLS:** rustls + rcgen (certificate generation)
-- **HTTP:** hyper
-- **Storage:**
-  - SQLite (index: hash → file path, metadata)
-  - Filesystem (content: `/{hash[0:2]}/{hash[2:4]}/{hash}.bin`)
-- **Hashing:** SHA-256 (first 64KB)
-- **Network:** iptables/nftables for transparent proxy
-
-## Expected Performance
-
-### Bandwidth Savings
-
-| Scenario | Without Cache | With HomeCDN | Savings |
-|----------|--------------|--------------|---------|
-| Same cartoon 50x | 50 × 500MB = 25GB | 500MB + 50 × ~0 | 98% |
-| OS updates (4 devices) | 4 × 3GB = 12GB | 3GB | 75% |
-| Mixed usage | 150GB/month | ~30GB/month | 80% |
-
-### Latency
-
-- Cache hit: <5ms (local SSD)
-- Cache miss: +10-20ms overhead (hashing + storage)
-
-## Limitations
-
-1. **HTTPS MITM required** — need to install CA certificate on devices
-2. **Certificate pinning** — some apps may reject proxy (banking apps)
-3. **Live streams** — cannot cache real-time content
-4. **DRM content** — Netflix, etc. use encryption that prevents caching
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| Video platform | MediaCMS | UI, accounts, search, playback |
+| Content downloader | Pinchflat | Auto-download by subscriptions |
+| Video engine | yt-dlp | Download from YouTube/RuTube |
+| Gateway/fallback | nginx or custom | Error detection, landing page |
+| DNS | Keenetic / dnsmasq | `video.home` resolution |
+| Storage | Filesystem (HDD) | Shared video library |
+| Deployment | Docker Compose | All services containerized |
 
 ## Project Structure
 
 ```
 homecdn/
-├── README.md           # This file
-├── materials/          # Research, prototypes, experiments
-├── src/
-│   ├── main.rs
-│   ├── proxy/          # MITM proxy implementation
-│   ├── cache/          # Content-addressable storage
-│   ├── tls/            # Certificate generation
-│   └── config/         # Configuration handling
-├── Cargo.toml
-└── config.example.toml
+├── README.md              # This file
+├── docker-compose.yml     # All services
+├── mediacms/              # MediaCMS configuration
+├── pinchflat/             # Pinchflat configuration
+├── fallback/              # Error page server + landing page
+├── nginx/                 # Gateway/proxy configuration
+└── materials/             # Research, prototypes
 ```
 
 ## References
 
 ### Research Sources
 
+- [MediaCMS — Self-hosted CMS](https://mediacms.io/)
+- [Pinchflat — YouTube auto-downloader](https://github.com/kieraneglin/pinchflat)
 - [RuTube CDN Architecture (Habr)](https://habr.com/ru/companies/habr_rutube/articles/919360/)
 - [RuTube 10 Tbps Architecture (Habr)](https://habr.com/ru/companies/habr_rutube/articles/887748/)
-- [Reverse-Engineering YouTube](https://tyrrrz.me/blog/reverse-engineering-youtube)
-- [YouTube itag Codes](https://gist.github.com/sidneys/7095afe4da4ae58694d128b1034e01e2)
-- [yt-dlp format_lmt Discussion](https://github.com/yt-dlp/yt-dlp/issues/11840)
-- [NGINX Content Caching](https://docs.nginx.com/nginx/admin-guide/content-cache/content-caching/)
-- [HLS Caching with NGINX](https://help.cesbo.com/misc/tools-and-utilities/network/hls-caching-proxy-with-nginx/)
-- [Varnish for Video Streaming](https://info.varnish-software.com/blog/three-features-varnish-ideal-video-streaming)
+- [yt-dlp — Video downloader](https://github.com/yt-dlp/yt-dlp)
 - [LanCache Documentation](https://lancache.net/docs/)
 
 ### Similar Projects
 
-- [LanCache](https://lancache.net/) — game/update caching (HTTP only)
-- [nginx-vod-module](https://github.com/kaltura/nginx-vod-module) — on-the-fly HLS/DASH
-- [HLS-Proxy](https://github.com/warren-bank/HLS-Proxy) — Node.js HLS proxy
+- [LanCache](https://lancache.net/) — game/update caching
+- [Tube Archivist](https://www.tubearchivist.com/) — YouTube archive manager
+- [Jellyfin](https://jellyfin.org/) — self-hosted media system
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
